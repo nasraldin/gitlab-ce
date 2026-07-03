@@ -10,6 +10,8 @@ shared S3 cache — **no manual steps**.
 > (`make up`) and it comes back fully configured. You just log in to the
 > dashboard and start working — no registering runners, no creating buckets.
 
+![GitLab dashboard at http://localhost:8929](screenshot.png)
+
 ## Contents
 
 | File                           | Purpose                                                     |
