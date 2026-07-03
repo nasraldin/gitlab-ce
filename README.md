@@ -571,7 +571,7 @@ workers and memory.
   a harmless race — runners started before `runner-bootstrap` created their config.
   Fixed by `scripts/runner-entrypoint.sh`, which waits for bootstrap then starts.
   After `make up`, you should only see `[runner-entrypoint] waiting for
-  runner-bootstrap…` followed by `config ready, starting gitlab-runner`. If it
+runner-bootstrap…` followed by `config ready, starting gitlab-runner`. If it
   persists past ~10 minutes, check `make bootstrap-logs`.
 - **Runners didn't register / job still stuck:** the auto-provisioner waits for
   the API, but if it exited early (`make bootstrap-logs` shows an error), just

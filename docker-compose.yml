@@ -1,6 +1,10 @@
 # ==============================================================================
 # GitLab CE - Production-grade Docker Compose setup
 #
+#   Author: Nasr Aldin
+#   Email: nasr2ldin@gmail.com
+#   Repository: https://github.com/nasraldin/gitlab-ce
+#
 #   Docs:  https://docs.gitlab.com/ee/install/docker/
 #   Image: https://hub.docker.com/r/gitlab/gitlab-ce
 #
