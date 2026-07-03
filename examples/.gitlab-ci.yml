@@ -1,0 +1,106 @@
+# =============================================================================
+# Example .gitlab-ci.yml tuned for a LARGE MONOREPO on this local setup.
+#
+# Copy the parts you need into the root .gitlab-ci.yml of your project.
+# It demonstrates:
+#   * fast git checkout for big repos (shallow clone + fetch strategy)
+#   * a shared S3 (MinIO) cache keyed per component
+#   * building & pushing an image to the built-in Container Registry via dind
+#   * path-based rules so only changed components build (monorepo essential)
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Global settings
+# ---------------------------------------------------------------------------
+variables:
+  # --- Large-repo checkout tuning ---
+  GIT_STRATEGY: fetch          # reuse the cached working copy between jobs
+  GIT_DEPTH: "20"              # shallow clone; raise if you need more history
+  GIT_SUBMODULE_STRATEGY: none # set to 'recursive' only if you use submodules
+  FF_USE_FASTZIP: "true"       # faster cache/artifact (de)compression
+  CACHE_COMPRESSION_LEVEL: "fast"
+  TRANSFER_METER_FREQUENCY: "2s"
+
+  # --- Docker-in-Docker (image builds) ---
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: "1"
+  DOCKER_CERT_PATH: "/certs/client"
+
+default:
+  tags:
+    - docker            # matches the runner registered by scripts/register-runner.sh
+  # Retry only on infrastructure/runner failures, not on real test failures.
+  retry:
+    max: 2
+    when:
+      - runner_system_failure
+      - stuck_or_timeout_failure
+
+stages:
+  - build
+  - test
+  - package
+
+# ---------------------------------------------------------------------------
+# Reusable cache anchors (per component => better hit rate in a monorepo)
+# ---------------------------------------------------------------------------
+.node_cache: &node_cache
+  key:
+    files:
+      - package-lock.json
+  paths:
+    - .npm/
+  policy: pull-push
+
+# ---------------------------------------------------------------------------
+# Example: a service that only builds when its files change
+# ---------------------------------------------------------------------------
+build:api:
+  stage: build
+  image: node:22-alpine
+  cache:
+    <<: *node_cache
+  rules:
+    - changes:
+        - "services/api/**/*"
+        - "package-lock.json"
+  script:
+    - echo "Building services/api ..."
+    - npm ci --cache .npm --prefer-offline || true
+    - echo "build done"
+
+test:api:
+  stage: test
+  image: node:22-alpine
+  needs: ["build:api"]
+  cache:
+    <<: *node_cache
+    policy: pull        # tests only read the cache
+  rules:
+    - changes:
+        - "services/api/**/*"
+  script:
+    - echo "Testing services/api ..."
+    - echo "tests passed"
+
+# ---------------------------------------------------------------------------
+# Build & push a Docker image to the built-in Container Registry.
+#
+# NOTE: the registry is served over plain HTTP (gitlab.local:5050), so the dind
+# service must be told to trust it as an insecure registry.
+# ---------------------------------------------------------------------------
+package:api:
+  stage: package
+  image: docker:27-cli
+  services:
+    - name: docker:27-dind
+      command: ["--insecure-registry=gitlab.local:5050"]
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+      changes:
+        - "services/api/**/*"
+  script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker build -t "$CI_REGISTRY_IMAGE/api:$CI_COMMIT_SHORT_SHA" services/api
+    - docker push "$CI_REGISTRY_IMAGE/api:$CI_COMMIT_SHORT_SHA"

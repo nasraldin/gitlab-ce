@@ -1,0 +1,385 @@
+# ==============================================================================
+# GitLab CE - Production-grade Docker Compose setup
+#
+#   Docs:  https://docs.gitlab.com/ee/install/docker/
+#   Image: https://hub.docker.com/r/gitlab/gitlab-ce
+#
+# Usage:
+#   cp .env.example .env    # then edit values
+#   docker compose up -d
+#   docker compose logs -f gitlab
+# ==============================================================================
+
+name: gitlab-ce
+
+# Shared definition for every GitLab Runner container. Each runner service
+# below reuses this via `<<: *runner-base` and only overrides its name/volume.
+# Runners are auto-registered by `runner-bootstrap`. On first boot the config
+# volume is empty, so a wrapper entrypoint waits for config.toml before starting.
+x-runner-base: &runner-base
+  image: ${GITLAB_RUNNER_IMAGE:-gitlab/gitlab-runner}:${GITLAB_RUNNER_VERSION:-latest}
+  restart: unless-stopped
+  entrypoint: ["/bin/sh", "/scripts/runner-entrypoint.sh"]
+  depends_on:
+    gitlab:
+      condition: service_healthy
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "20m"
+      max-file: "3"
+  deploy:
+    resources:
+      limits:
+        cpus: "${RUNNER_CPU_LIMIT:-2}"
+        memory: ${RUNNER_MEM_LIMIT:-2g}
+
+services:
+  gitlab:
+    image: ${GITLAB_IMAGE:-gitlab/gitlab-ce}:${GITLAB_VERSION:-latest}
+    container_name: gitlab-ce
+    restart: unless-stopped
+    depends_on:
+      minio:
+        condition: service_healthy
+      minio-setup:
+        condition: service_completed_successfully
+
+    # GitLab is sensitive to hostname; it is baked into repo URLs, emails, etc.
+    hostname: ${GITLAB_HOSTNAME:-gitlab.local}
+
+    # Omnibus GitLab configuration. Everything you would normally put in
+    # /etc/gitlab/gitlab.rb can be provided here via GITLAB_OMNIBUS_CONFIG.
+    environment:
+      TZ: ${TZ:-UTC}
+      GITLAB_ROOT_PASSWORD: ${GITLAB_ROOT_PASSWORD:-}
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url '${GITLAB_EXTERNAL_URL:-http://localhost:8929}'
+
+        # --- Git over SSH -----------------------------------------------------
+        gitlab_rails['gitlab_shell_ssh_port'] = ${GITLAB_SHELL_SSH_PORT:-2224}
+
+        # --- Container Registry ----------------------------------------------
+        # Served over plain HTTP on a dedicated port. Reachable in-network as
+        # gitlab.local:5050 (network alias) and from the host via /etc/hosts.
+        registry_external_url '${GITLAB_REGISTRY_EXTERNAL_URL:-http://gitlab.local:5050}'
+        registry_nginx['listen_port'] = ${GITLAB_REGISTRY_PORT:-5050}
+        registry_nginx['listen_https'] = false
+
+        # --- Object storage (MinIO, S3-compatible) ---------------------------
+        # CI artifacts, LFS, uploads, packages, registry layers, etc. live in
+        # MinIO instead of the gitlab-ce-data volume — keeps the node lean and
+        # is the recommended single-node externalization. Buckets are created
+        # automatically by the minio-setup service before GitLab starts.
+        gitlab_rails['object_store']['enabled'] = true
+        gitlab_rails['object_store']['connection'] = {
+          'provider' => 'AWS',
+          'region' => 'us-east-1',
+          'endpoint' => 'http://minio:9000',
+          'path_style' => true,
+          'aws_access_key_id' => '${MINIO_ROOT_USER:-gitlab-minio}',
+          'aws_secret_access_key' => '${MINIO_ROOT_PASSWORD:-ChangeMe_MinioP@ss!}'
+        }
+        gitlab_rails['object_store']['objects']['artifacts']['bucket'] = '${GITLAB_OBJECT_BUCKET_ARTIFACTS:-gitlab-artifacts}'
+        gitlab_rails['object_store']['objects']['lfs']['bucket'] = '${GITLAB_OBJECT_BUCKET_LFS:-gitlab-lfs}'
+        gitlab_rails['object_store']['objects']['uploads']['bucket'] = '${GITLAB_OBJECT_BUCKET_UPLOADS:-gitlab-uploads}'
+        gitlab_rails['object_store']['objects']['packages']['bucket'] = '${GITLAB_OBJECT_BUCKET_PACKAGES:-gitlab-packages}'
+        gitlab_rails['object_store']['objects']['dependency_proxy']['bucket'] = '${GITLAB_OBJECT_BUCKET_DEPENDENCY_PROXY:-gitlab-dependency-proxy}'
+        gitlab_rails['object_store']['objects']['terraform_state']['bucket'] = '${GITLAB_OBJECT_BUCKET_TERRAFORM_STATE:-gitlab-terraform-state}'
+        gitlab_rails['object_store']['objects']['ci_secure_files']['bucket'] = '${GITLAB_OBJECT_BUCKET_CI_SECURE_FILES:-gitlab-ci-secure-files}'
+        gitlab_rails['object_store']['objects']['pages']['bucket'] = '${GITLAB_OBJECT_BUCKET_PAGES:-gitlab-pages}'
+        gitlab_rails['object_store']['objects']['external_diffs']['bucket'] = '${GITLAB_OBJECT_BUCKET_EXTERNAL_DIFFS:-gitlab-external-diffs}'
+
+        # Container Registry image layers (separate Omnibus key from Rails store)
+        registry['storage'] = {
+          's3' => {
+            'accesskey' => '${MINIO_ROOT_USER:-gitlab-minio}',
+            'secretkey' => '${MINIO_ROOT_PASSWORD:-ChangeMe_MinioP@ss!}',
+            'bucket' => '${GITLAB_OBJECT_BUCKET_REGISTRY:-gitlab-registry}',
+            'region' => 'us-east-1',
+            'regionendpoint' => 'http://minio:9000',
+            'pathstyle' => true,
+            'v4auth' => true
+          }
+        }
+        registry['storage_delete']['enabled'] = true
+
+        # --- Web server (Puma) tuning ----------------------------------------
+        puma['worker_processes'] = ${GITLAB_PUMA_WORKERS:-2}
+
+        # --- Background jobs (Sidekiq) ---------------------------------------
+        sidekiq['max_concurrency'] = ${GITLAB_SIDEKIQ_CONCURRENCY:-10}
+
+        # --- Bundled PostgreSQL tuning ---------------------------------------
+        postgresql['shared_buffers'] = "${GITLAB_POSTGRES_SHARED_BUFFERS:-256MB}"
+        postgresql['max_connections'] = 200
+
+        # --- Trim memory footprint for small/medium deployments --------------
+        # Disable the bundled Prometheus/Grafana monitoring stack (~saves RAM).
+        prometheus_monitoring['enable'] = false
+
+        # Reduce the number of unicorn/puma preload copies retained.
+        puma['per_worker_max_memory_mb'] = 1024
+
+        # --- Housekeeping / backups ------------------------------------------
+        # Keep 3 days of local backups.
+        gitlab_rails['backup_keep_time'] = 259200
+
+    # Reachable inside the compose network as `gitlab`, `gitlab-ce` and
+    # `gitlab.local`. The last alias matches the registry/registry URLs so CI
+    # jobs can resolve the same hostname the registry advertises.
+    networks:
+      default:
+        aliases:
+          - gitlab.local
+
+    ports:
+      - "${GITLAB_HTTP_PORT:-8929}:${GITLAB_HTTP_PORT:-8929}" # HTTP  (matches external_url port)
+      - "${GITLAB_HTTPS_PORT:-8443}:443" # HTTPS
+      - "${GITLAB_SSH_PORT:-2224}:22" # Git over SSH
+      - "${GITLAB_REGISTRY_PORT:-5050}:${GITLAB_REGISTRY_PORT:-5050}" # Container Registry
+
+    # Persist config, logs, data and backups in named volumes.
+    #
+    # IMPORTANT: named volumes are used instead of host bind mounts on purpose.
+    # GitLab's Omnibus reconfigure asserts strict ownership (e.g. git:git on
+    # /var/opt/gitlab/git-data/repositories). Docker Desktop bind mounts on
+    # macOS/Windows cannot honor those uid/gid ownerships, which makes
+    # reconfigure fail with "Failed asserting that ownership ... was git:git".
+    # Named volumes live on the Docker VM's native Linux filesystem where the
+    # ownership is preserved correctly. Use `make backup` / `docker cp` to get
+    # data out of the volumes.
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+
+    # GitLab's PostgreSQL needs a larger shared-memory segment than Docker's
+    # 64 MB default, otherwise you get "could not resize shared memory" errors.
+    shm_size: "256m"
+
+    # Container-level healthcheck powered by GitLab's own status endpoint.
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "/opt/gitlab/bin/gitlab-healthcheck",
+          "--fail",
+          "--max-time",
+          "10",
+        ]
+      interval: 60s
+      timeout: 30s
+      retries: 5
+      start_period: 600s # first boot can take several minutes to reconfigure
+
+    # Recommended by GitLab to allow enough file descriptors / processes.
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+
+    # Log rotation so container logs don't grow unbounded.
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+    # Resource guardrails. GitLab CE minimum is 4 vCPU / 4 GB RAM,
+    # 8 GB RAM recommended. Adjust in .env.
+    deploy:
+      resources:
+        limits:
+          cpus: "${GITLAB_CPU_LIMIT:-6}"
+          memory: ${GITLAB_MEM_LIMIT:-8g}
+        reservations:
+          cpus: "${GITLAB_CPU_RESERVATION:-2}"
+          memory: ${GITLAB_MEM_RESERVATION:-4g}
+
+  # ============================================================================
+  # MinIO (S3-compatible object storage).
+  #
+  # Used for:
+  #   * GitLab object storage (CI artifacts, LFS, uploads, packages, …)
+  #   * Container Registry image layers
+  #   * GitLab Runner distributed CI cache
+  # ============================================================================
+  minio:
+    image: ${MINIO_IMAGE:-minio/minio}:${MINIO_IMAGE_VERSION:-latest}
+    container_name: gitlab-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gitlab-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ChangeMe_MinioP@ss!}
+    ports:
+      - "${MINIO_PORT:-9000}:9000" # S3 API
+      - "${MINIO_CONSOLE_PORT:-9001}:9001" # Web console
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "mc ready local || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 20s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    deploy:
+      resources:
+        limits:
+          cpus: "1"
+          memory: 2g
+
+  # One-shot job: create all MinIO buckets (GitLab object store + runner cache).
+  minio-setup:
+    image: ${MINIO_MC_IMAGE:-minio/mc}:latest
+    container_name: gitlab-minio-setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      MINIO_ENDPOINT: http://minio:9000
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gitlab-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ChangeMe_MinioP@ss!}
+      RUNNER_CACHE_BUCKET: ${RUNNER_CACHE_BUCKET:-runner-cache}
+      GITLAB_OBJECT_BUCKET_ARTIFACTS: ${GITLAB_OBJECT_BUCKET_ARTIFACTS:-gitlab-artifacts}
+      GITLAB_OBJECT_BUCKET_LFS: ${GITLAB_OBJECT_BUCKET_LFS:-gitlab-lfs}
+      GITLAB_OBJECT_BUCKET_UPLOADS: ${GITLAB_OBJECT_BUCKET_UPLOADS:-gitlab-uploads}
+      GITLAB_OBJECT_BUCKET_PACKAGES: ${GITLAB_OBJECT_BUCKET_PACKAGES:-gitlab-packages}
+      GITLAB_OBJECT_BUCKET_DEPENDENCY_PROXY: ${GITLAB_OBJECT_BUCKET_DEPENDENCY_PROXY:-gitlab-dependency-proxy}
+      GITLAB_OBJECT_BUCKET_TERRAFORM_STATE: ${GITLAB_OBJECT_BUCKET_TERRAFORM_STATE:-gitlab-terraform-state}
+      GITLAB_OBJECT_BUCKET_CI_SECURE_FILES: ${GITLAB_OBJECT_BUCKET_CI_SECURE_FILES:-gitlab-ci-secure-files}
+      GITLAB_OBJECT_BUCKET_PAGES: ${GITLAB_OBJECT_BUCKET_PAGES:-gitlab-pages}
+      GITLAB_OBJECT_BUCKET_EXTERNAL_DIFFS: ${GITLAB_OBJECT_BUCKET_EXTERNAL_DIFFS:-gitlab-external-diffs}
+      GITLAB_OBJECT_BUCKET_REGISTRY: ${GITLAB_OBJECT_BUCKET_REGISTRY:-gitlab-registry}
+    volumes:
+      - ./scripts/minio-setup.sh:/scripts/minio-setup.sh:ro
+    entrypoint: ["/bin/sh", "/scripts/minio-setup.sh"]
+    restart: "no"
+
+  # ============================================================================
+  # GitLab Runners (Docker executor) - a fleet of 5, auto-registered.
+  #
+  # Jobs run in sibling containers spawned via the host Docker socket, attached
+  # to this compose network so they can resolve `gitlab.local`, `minio`, etc.
+  # Privileged job containers are enabled so pipelines can use Docker-in-Docker
+  # (docker:dind) to build & push images to the registry.
+  #
+  # Registration is fully automatic (see the `runner-bootstrap` service); no
+  # human action is required. Each runner keeps its own config volume so it is
+  # only registered once and survives restarts.
+  # ============================================================================
+  gitlab-runner:
+    <<: *runner-base
+    container_name: gitlab-runner
+    hostname: gitlab-runner
+    volumes:
+      - ./scripts/runner-entrypoint.sh:/scripts/runner-entrypoint.sh:ro
+      - gitlab-runner-config-00:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  gitlab-runner-01:
+    <<: *runner-base
+    container_name: gitlab-runner-01
+    hostname: gitlab-runner-01
+    volumes:
+      - ./scripts/runner-entrypoint.sh:/scripts/runner-entrypoint.sh:ro
+      - gitlab-runner-config-01:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  gitlab-runner-02:
+    <<: *runner-base
+    container_name: gitlab-runner-02
+    hostname: gitlab-runner-02
+    volumes:
+      - ./scripts/runner-entrypoint.sh:/scripts/runner-entrypoint.sh:ro
+      - gitlab-runner-config-02:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  gitlab-runner-03:
+    <<: *runner-base
+    container_name: gitlab-runner-03
+    hostname: gitlab-runner-03
+    volumes:
+      - ./scripts/runner-entrypoint.sh:/scripts/runner-entrypoint.sh:ro
+      - gitlab-runner-config-03:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  gitlab-runner-04:
+    <<: *runner-base
+    container_name: gitlab-runner-04
+    hostname: gitlab-runner-04
+    volumes:
+      - ./scripts/runner-entrypoint.sh:/scripts/runner-entrypoint.sh:ro
+      - gitlab-runner-config-04:/etc/gitlab-runner
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  # ============================================================================
+  # Runner auto-provisioner (one-shot, idempotent).
+  # Waits for GitLab to be healthy, mints modern runner authentication tokens
+  # via the API for any runner container that isn't registered yet, registers
+  # each with the Docker executor + shared S3 cache, and prunes stale entries.
+  # Re-running `docker compose up` is safe: already-registered runners are
+  # skipped. GitLab 18+ removed legacy registration tokens, hence this flow.
+  # ============================================================================
+  runner-bootstrap:
+    image: docker:27-cli
+    container_name: gitlab-runner-bootstrap
+    restart: "no"
+    depends_on:
+      gitlab:
+        condition: service_healthy
+      gitlab-runner:
+        condition: service_started
+      gitlab-runner-01:
+        condition: service_started
+      gitlab-runner-02:
+        condition: service_started
+      gitlab-runner-03:
+        condition: service_started
+      gitlab-runner-04:
+        condition: service_started
+    environment:
+      GITLAB_CONTAINER: gitlab-ce
+      RUNNER_CONTAINERS: "gitlab-runner gitlab-runner-01 gitlab-runner-02 gitlab-runner-03 gitlab-runner-04"
+      CI_INTERNAL_URL: ${CI_INTERNAL_URL:-http://gitlab:8929}
+      NETWORK_NAME: gitlab-ce-net
+      RUNNER_TAGS: ${RUNNER_TAGS:-docker,monorepo}
+      RUNNER_DEFAULT_IMAGE: ${RUNNER_DEFAULT_IMAGE:-docker:27-cli}
+      RUNNER_CONCURRENT: ${RUNNER_CONCURRENT:-4}
+      RUNNER_CACHE_BUCKET: ${RUNNER_CACHE_BUCKET:-runner-cache}
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-gitlab-minio}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-ChangeMe_MinioP@ss!}
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./scripts:/scripts:ro
+    entrypoint: ["/bin/sh", "/scripts/bootstrap-runners.sh"]
+
+volumes:
+  gitlab-config:
+    name: gitlab-ce-config
+  gitlab-logs:
+    name: gitlab-ce-logs
+  gitlab-data:
+    name: gitlab-ce-data
+  gitlab-runner-config-00:
+    name: gitlab-ce-runner-config-00
+  gitlab-runner-config-01:
+    name: gitlab-ce-runner-config-01
+  gitlab-runner-config-02:
+    name: gitlab-ce-runner-config-02
+  gitlab-runner-config-03:
+    name: gitlab-ce-runner-config-03
+  gitlab-runner-config-04:
+    name: gitlab-ce-runner-config-04
+  minio-data:
+    name: gitlab-ce-minio-data
+
+networks:
+  default:
+    name: gitlab-ce-net

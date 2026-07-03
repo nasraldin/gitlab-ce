@@ -1,0 +1,12 @@
+# Local secrets / environment
+.env
+
+# Backups copied out of the container (make backup-pull)
+backups/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
